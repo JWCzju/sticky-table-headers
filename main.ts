@@ -1,179 +1,255 @@
 import { Plugin } from 'obsidian';
 
-/**
- * Table Sticky Header Plugin
- * 
- * 修复问题：
- * 1. 宽度对齐 - 使用 getBoundingClientRect 精确同步
- * 2. 样式一致 - 继承原表格样式
- * 3. 横向滚动 - 克隆容器跟随水平滚动容器，而非 translateX
- * 4. 窄表格 - 克隆容器宽度跟随表格实际宽度
- */
+const TABLE_SELECTOR = '.markdown-reading-view table, .markdown-preview-view table, .cm-table-widget table';
+const EXCLUDED_SELECTOR = '.tsh-clone-wrapper, .markmap, [data-type="myMarkmap"], foreignObject';
+
+interface StickyTable {
+    update: () => void;
+    invalidate: () => void;
+    isCurrent: () => boolean;
+    cleanup: () => void;
+}
+
 export default class TableStickyHeaderPlugin extends Plugin {
     private mutationObserver: MutationObserver | null = null;
-    private processedTables: WeakSet<HTMLTableElement> = new WeakSet();
-    private cleanupFunctions: Map<HTMLTableElement, () => void> = new Map();
+    private tables = new Map<HTMLTableElement, StickyTable>();
+    private pendingTables = new Set<HTMLTableElement>();
+    private dirtyTables = new Set<HTMLTableElement>();
+    private frameId: number | null = null;
+    private checkRemovedTables = false;
+    private unloaded = false;
 
-    async onload() {
+    onload() {
+        this.mutationObserver = new MutationObserver((records) => this.onMutations(records));
+        this.mutationObserver.observe(document.body, { childList: true, subtree: true });
+
         this.app.workspace.onLayoutReady(() => {
-            this.processAllTables();
+            if (this.unloaded) return;
+            document.querySelectorAll<HTMLTableElement>(TABLE_SELECTOR).forEach((table) => {
+                this.pendingTables.add(table);
+            });
+            if (this.pendingTables.size) this.scheduleFrame();
         });
 
-        this.registerEvent(
-            this.app.workspace.on('layout-change', () => {
-                setTimeout(() => this.processAllTables(), 200);
-            })
-        );
-
-        this.registerEvent(
-            this.app.workspace.on('active-leaf-change', () => {
-                setTimeout(() => this.processAllTables(), 200);
-            })
-        );
-
-        this.mutationObserver = new MutationObserver(() => {
-            this.processAllTables();
-        });
-
-        this.mutationObserver.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
+        const invalidateLayout = () => {
+            this.tables.forEach((state) => state.invalidate());
+        };
+        this.registerEvent(this.app.workspace.on('layout-change', invalidateLayout));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', invalidateLayout));
+        this.registerDomEvent(window, 'resize', invalidateLayout);
     }
 
     onunload() {
-        this.cleanupFunctions.forEach((cleanup) => cleanup());
-        this.cleanupFunctions.clear();
-        document.querySelectorAll('.tsh-clone-wrapper').forEach((el) => el.remove());
+        this.unloaded = true;
         this.mutationObserver?.disconnect();
+        if (this.frameId !== null) cancelAnimationFrame(this.frameId);
+        this.frameId = null;
+        this.tables.forEach((state) => state.cleanup());
+        this.tables.clear();
+        this.pendingTables.clear();
+        this.dirtyTables.clear();
     }
 
-    private processAllTables() {
-        const tables = document.querySelectorAll<HTMLTableElement>(
-            '.markdown-reading-view table, .markdown-preview-view table, .cm-table-widget table'
-        );
+    private onMutations(records: MutationRecord[]) {
+        for (const record of records) {
+            // Text replacement is common during typing. It cannot introduce or
+            // remove a table, and table-local observers handle header text edits.
+            if (!Array.from(record.addedNodes).some((node) => node instanceof Element) &&
+                !Array.from(record.removedNodes).some((node) => node instanceof Element)) continue;
+            const target = record.target as Element;
+            if (target.closest(EXCLUDED_SELECTOR)) continue;
 
-        tables.forEach((table) => {
-            if (!this.processedTables.has(table) && !table.closest('.tsh-clone-wrapper')) {
-                // Skip tables inside markmap views (side panel SVG or inline markmap)
-                if (table.closest('.markmap') || table.closest('[data-type="myMarkmap"]') || table.closest('foreignObject')) return;
-                this.setupStickyHeader(table);
-                this.processedTables.add(table);
+            // Content changes in existing tables have their own observer. Ordinary
+            // text edits do not require a document scan or a geometry update.
+            const table = target.closest<HTMLTableElement>('table');
+            if (table && !this.tables.has(table)) this.pendingTables.add(table);
+
+            for (const node of Array.from(record.addedNodes)) {
+                if (!(node instanceof Element) || node.closest(EXCLUDED_SELECTOR)) continue;
+                if (node.matches('table')) this.pendingTables.add(node as HTMLTableElement);
+                node.querySelectorAll<HTMLTableElement>('table').forEach((addedTable) => {
+                    this.pendingTables.add(addedTable);
+                });
             }
+            if (this.tables.size && !this.checkRemovedTables) {
+                for (const node of Array.from(record.removedNodes)) {
+                    if (node instanceof Element && !node.matches(EXCLUDED_SELECTOR) &&
+                        (node.matches('table') || node.querySelector('table'))) {
+                        this.checkRemovedTables = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (this.pendingTables.size || this.checkRemovedTables) this.scheduleFrame();
+    }
+
+    private scheduleUpdate(table: HTMLTableElement) {
+        this.dirtyTables.add(table);
+        this.scheduleFrame();
+    }
+
+    private scheduleFrame() {
+        if (this.unloaded || this.frameId !== null) return;
+        this.frameId = requestAnimationFrame(() => {
+            this.frameId = null;
+            if (this.checkRemovedTables) {
+                this.checkRemovedTables = false;
+                this.tables.forEach((state, table) => {
+                    if (!state.isCurrent()) {
+                        state.cleanup();
+                        this.tables.delete(table);
+                        this.dirtyTables.delete(table);
+                    }
+                });
+            }
+            const pending = Array.from(this.pendingTables);
+            this.pendingTables.clear();
+            for (const table of pending) {
+                if (table.isConnected && table.matches(TABLE_SELECTOR) &&
+                    !table.closest(EXCLUDED_SELECTOR) && !this.tables.has(table)) {
+                    this.setupStickyHeader(table);
+                }
+            }
+            const dirty = Array.from(this.dirtyTables);
+            this.dirtyTables.clear();
+            for (const table of dirty) this.tables.get(table)?.update();
         });
     }
 
     private setupStickyHeader(table: HTMLTableElement) {
-        const thead = table.querySelector('thead');
-        if (!thead) return;
-
-        // 找到滚动容器
+        let thead = table.querySelector('thead');
         const scrollContainer = this.findVerticalScrollContainer(table);
-        if (!scrollContainer) return;
-
-        // 找到水平滚动的父容器
+        if (!thead || !scrollContainer) return;
         const hScrollContainer = this.findHorizontalScrollContainer(table);
 
-        // 创建克隆结构
         const wrapper = document.createElement('div');
         wrapper.className = 'tsh-clone-wrapper';
-
         const scroller = document.createElement('div');
         scroller.className = 'tsh-clone-scroller';
         wrapper.appendChild(scroller);
 
-        // 克隆表格
-        const clonedTable = table.cloneNode(true) as HTMLTableElement;
+        // The body is never displayed; cloning it wastes work on long tables.
+        const clonedTable = table.cloneNode(false) as HTMLTableElement;
         clonedTable.removeAttribute('data-sticky-header-initialized');
         scroller.appendChild(clonedTable);
-
         document.body.appendChild(wrapper);
 
-        // 更新逻辑
+        let headerDirty = true;
+        let widthsDirty = true;
+        let boundaryHeight = -1;
+        let boundaryObserver: IntersectionObserver | null = null;
+        const schedule = () => this.scheduleUpdate(table);
+        const invalidate = () => {
+            widthsDirty = true;
+            schedule();
+        };
+        const resizeObserver = new ResizeObserver(invalidate);
+        resizeObserver.observe(table);
+        resizeObserver.observe(thead);
+        resizeObserver.observe(scrollContainer);
+        const leafContent = table.closest('.workspace-leaf-content');
+        if (leafContent) resizeObserver.observe(leafContent);
+
+        const contentObserver = new MutationObserver((records) => {
+            headerDirty = headerDirty || records.some((record) =>
+                record.target === table || thead?.contains(record.target));
+            invalidate();
+        });
+        contentObserver.observe(table, { childList: true, subtree: true, characterData: true, attributes: true });
+
         const update = () => {
-            // 检查表格是否还在 DOM 中
-            if (!document.body.contains(table)) {
-                wrapper.classList.remove('tsh-visible');
+            if (!table.isConnected) return;
+            const currentHeader = table.querySelector('thead');
+            if (currentHeader !== thead) {
+                if (thead) resizeObserver.unobserve(thead);
+                thead = currentHeader;
+                if (thead) resizeObserver.observe(thead);
+                headerDirty = true;
+                widthsDirty = true;
+                boundaryHeight = -1;
+            }
+            if (!thead) {
+                if (wrapper.classList.contains('tsh-visible')) wrapper.classList.remove('tsh-visible');
+                boundaryObserver?.disconnect();
                 return;
             }
 
             const tableRect = table.getBoundingClientRect();
             const theadRect = thead.getBoundingClientRect();
             const containerRect = scrollContainer.getBoundingClientRect();
-
-            // 获取当前 leaf 容器，确保不超出范围
-            const leafContent = table.closest('.workspace-leaf-content');
-            const leafRect = leafContent?.getBoundingClientRect();
-
             const headerHeight = theadRect.height;
             const topBoundary = containerRect.top;
 
-            // 判断是否需要 sticky
-            const shouldStick = theadRect.top < topBoundary &&
-                tableRect.bottom > topBoundary + headerHeight;
-
-            if (shouldStick) {
-                wrapper.classList.add('tsh-visible');
-
-                // 同步列宽（精确复制每个单元格宽度）
-                this.syncColumnWidths(table, clonedTable);
-
-                // 计算可见区域
-                let visibleLeft = tableRect.left;
-                let visibleWidth = tableRect.width;
-
-                // 如果有 leaf 边界，裁剪到 leaf 范围内
-                if (leafRect) {
-                    const clippedLeft = Math.max(tableRect.left, leafRect.left);
-                    const clippedRight = Math.min(tableRect.right, leafRect.right);
-                    visibleLeft = clippedLeft;
-                    visibleWidth = Math.max(0, clippedRight - clippedLeft);
-                }
-
-                // 设置 wrapper 位置和大小（这是可见区域）
-                wrapper.style.top = `${topBoundary}px`;
-                wrapper.style.left = `${visibleLeft}px`;
-                wrapper.style.width = `${visibleWidth}px`;
-                wrapper.style.height = `${headerHeight}px`;
-
-                // scroller 需要容纳整个表格宽度
-                scroller.style.width = `${tableRect.width}px`;
-
-                // 通过 margin-left 模拟水平滚动偏移
-                // 偏移量 = 表格实际左边界 - 可见区域左边界
-                const offsetX = tableRect.left - visibleLeft;
-                scroller.style.marginLeft = `${offsetX}px`;
-
-            } else {
-                wrapper.classList.remove('tsh-visible');
+            // Watch crossings caused by content above the table moving it, even
+            // when neither scrolling nor a table resize occurs. The inset makes
+            // the header exit at its top and the table exit at its last header-height.
+            if (headerHeight !== boundaryHeight) {
+                boundaryHeight = headerHeight;
+                boundaryObserver?.disconnect();
+                boundaryObserver = new IntersectionObserver(schedule, {
+                    root: scrollContainer,
+                    rootMargin: `-${headerHeight}px 0px 0px 0px`,
+                });
+                boundaryObserver.observe(table);
+                boundaryObserver.observe(thead);
             }
+
+            const shouldStick = headerHeight > 0 && tableRect.width > 0 &&
+                theadRect.top < topBoundary && tableRect.bottom > topBoundary + headerHeight;
+            if (!shouldStick) {
+                if (wrapper.classList.contains('tsh-visible')) wrapper.classList.remove('tsh-visible');
+                return;
+            }
+
+            const leafRect = leafContent?.getBoundingClientRect();
+            const visibleLeft = leafRect ? Math.max(tableRect.left, leafRect.left) : tableRect.left;
+            const visibleRight = leafRect ? Math.min(tableRect.right, leafRect.right) : tableRect.right;
+
+            // Read all widths before writing styles, and only when invalidated.
+            const widths = widthsDirty ? Array.from(thead.querySelectorAll<HTMLElement>('th, td'),
+                (cell) => cell.getBoundingClientRect().width) : null;
+            if (headerDirty) {
+                clonedTable.replaceChildren(thead.cloneNode(true));
+                headerDirty = false;
+            }
+            if (widths) {
+                this.syncColumnWidths(clonedTable, widths, tableRect.width);
+                widthsDirty = false;
+            }
+            this.setStyle(wrapper, 'top', `${topBoundary}px`);
+            this.setStyle(wrapper, 'left', `${visibleLeft}px`);
+            this.setStyle(wrapper, 'width', `${Math.max(0, visibleRight - visibleLeft)}px`);
+            this.setStyle(wrapper, 'height', `${headerHeight}px`);
+            this.setStyle(scroller, 'width', `${tableRect.width}px`);
+            this.setStyle(scroller, 'marginLeft', `${tableRect.left - visibleLeft}px`);
+            if (!wrapper.classList.contains('tsh-visible')) wrapper.classList.add('tsh-visible');
         };
 
-        // 事件处理
-        const scrollHandler = () => requestAnimationFrame(update);
-
-        scrollContainer.addEventListener('scroll', scrollHandler, { passive: true });
+        scrollContainer.addEventListener('scroll', schedule, { passive: true });
         if (hScrollContainer && hScrollContainer !== scrollContainer) {
-            hScrollContainer.addEventListener('scroll', scrollHandler, { passive: true });
+            hScrollContainer.addEventListener('scroll', schedule, { passive: true });
         }
-        window.addEventListener('resize', scrollHandler, { passive: true });
-
-        // 定期检查（应对动态内容变化）
-        const intervalId = setInterval(update, 500);
-
-        // 初始更新
-        setTimeout(update, 100);
-
-        // 清理函数
-        this.cleanupFunctions.set(table, () => {
-            scrollContainer.removeEventListener('scroll', scrollHandler);
-            if (hScrollContainer) {
-                hScrollContainer.removeEventListener('scroll', scrollHandler);
-            }
-            window.removeEventListener('resize', scrollHandler);
-            clearInterval(intervalId);
-            wrapper.remove();
+        this.tables.set(table, {
+            update,
+            invalidate,
+            isCurrent: () => table.isConnected && table.matches(TABLE_SELECTOR) &&
+                !table.closest(EXCLUDED_SELECTOR) &&
+                this.findVerticalScrollContainer(table) === scrollContainer &&
+                this.findHorizontalScrollContainer(table) === hScrollContainer &&
+                table.closest('.workspace-leaf-content') === leafContent,
+            cleanup: () => {
+                scrollContainer.removeEventListener('scroll', schedule);
+                hScrollContainer?.removeEventListener('scroll', schedule);
+                resizeObserver.disconnect();
+                boundaryObserver?.disconnect();
+                contentObserver.disconnect();
+                wrapper.remove();
+            },
         });
+        // Setup already runs in the shared frame, so include its first update
+        // in that frame rather than scheduling a timer or another frame.
+        this.dirtyTables.add(table);
     }
 
     private findVerticalScrollContainer(element: HTMLElement): HTMLElement | null {
@@ -210,29 +286,20 @@ export default class TableStickyHeaderPlugin extends Plugin {
         return null;
     }
 
-    private syncColumnWidths(source: HTMLTableElement, target: HTMLTableElement) {
-        // 同步 thead 单元格宽度
-        const sourceTh = source.querySelectorAll('thead th, thead td');
-        const targetTh = target.querySelectorAll('thead th, thead td');
+    private setStyle(element: HTMLElement, property: 'top' | 'left' | 'width' | 'height' | 'marginLeft' | 'minWidth' | 'maxWidth' | 'boxSizing', value: string) {
+        if (element.style[property] !== value) element.style[property] = value;
+    }
 
-        sourceTh.forEach((cell, i) => {
-            if (targetTh[i]) {
-                const rect = (cell as HTMLElement).getBoundingClientRect();
-                const th = targetTh[i] as HTMLElement;
-                th.setCssStyles({
-                    width: `${rect.width}px`,
-                    minWidth: `${rect.width}px`,
-                    maxWidth: `${rect.width}px`,
-                    boxSizing: 'border-box',
-                });
-            }
+    private syncColumnWidths(target: HTMLTableElement, widths: number[], tableWidth: number) {
+        target.querySelectorAll<HTMLElement>('thead th, thead td').forEach((cell, i) => {
+            if (widths[i] === undefined) return;
+            const width = `${widths[i]}px`;
+            this.setStyle(cell, 'width', width);
+            this.setStyle(cell, 'minWidth', width);
+            this.setStyle(cell, 'maxWidth', width);
+            this.setStyle(cell, 'boxSizing', 'border-box');
         });
-
-        // 同步表格总宽度
-        const sourceRect = source.getBoundingClientRect();
-        target.setCssStyles({
-            width: `${sourceRect.width}px`,
-            minWidth: `${sourceRect.width}px`,
-        });
+        this.setStyle(target, 'width', `${tableWidth}px`);
+        this.setStyle(target, 'minWidth', `${tableWidth}px`);
     }
 }
