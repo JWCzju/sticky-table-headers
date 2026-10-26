@@ -82,9 +82,13 @@ export default class TableStickyHeaderPlugin extends Plugin {
         scroller.className = 'tsh-clone-scroller';
         wrapper.appendChild(scroller);
 
-        // 克隆表格
-        const clonedTable = table.cloneNode(true) as HTMLTableElement;
+        // Clone only the header. Cloning the body and hiding it with CSS still
+        // leaves the body's row in the table layout, which creates a blank row
+        // below the sticky header in Reading view.
+        const clonedTable = document.createElement('table');
+        clonedTable.className = table.className;
         clonedTable.removeAttribute('data-sticky-header-initialized');
+        clonedTable.appendChild(thead.cloneNode(true));
         scroller.appendChild(clonedTable);
 
         document.body.appendChild(wrapper);
@@ -118,31 +122,44 @@ export default class TableStickyHeaderPlugin extends Plugin {
                 // 同步列宽（精确复制每个单元格宽度）
                 this.syncColumnWidths(table, clonedTable);
 
-                // 计算可见区域
-                let visibleLeft = tableRect.left;
-                let visibleWidth = tableRect.width;
+                // Clip the clone to the same horizontal viewport as the table.
+                // Using only the table bounds lets the clone paint outside the
+                // visible side of a horizontally scrollable table.
+                const horizontalRect = hScrollContainer?.getBoundingClientRect();
+                const clipLeft = Math.max(
+                    horizontalRect?.left ?? -Infinity,
+                    leafRect?.left ?? -Infinity,
+                    0
+                );
+                const clipRight = Math.min(
+                    horizontalRect?.right ?? Infinity,
+                    leafRect?.right ?? Infinity,
+                    window.innerWidth
+                );
+                const visibleLeft = Math.max(tableRect.left, clipLeft);
+                const visibleRight = Math.min(tableRect.right, clipRight);
+                const visibleWidth = Math.max(0, visibleRight - visibleLeft);
 
-                // 如果有 leaf 边界，裁剪到 leaf 范围内
-                if (leafRect) {
-                    const clippedLeft = Math.max(tableRect.left, leafRect.left);
-                    const clippedRight = Math.min(tableRect.right, leafRect.right);
-                    visibleLeft = clippedLeft;
-                    visibleWidth = Math.max(0, clippedRight - clippedLeft);
+                // The cloned header no longer has the first body row beneath
+                // it. Recreate that row's separator on the floating wrapper so
+                // the transition from header to body remains visible.
+                const firstBodyCell = table.querySelector('tbody tr td, tbody tr th');
+                const separatorSource = firstBodyCell ?? table.querySelector('thead th, thead td');
+                if (separatorSource) {
+                    const separatorStyle = window.getComputedStyle(separatorSource);
+                    const width = separatorStyle.getPropertyValue('border-top-width');
+                    const style = separatorStyle.getPropertyValue('border-top-style');
+                    const color = separatorStyle.getPropertyValue('border-top-color');
+                    wrapper.style.borderBottom = `${width} ${style} ${color}`;
                 }
 
-                // 设置 wrapper 位置和大小（这是可见区域）
                 wrapper.style.top = `${topBoundary}px`;
                 wrapper.style.left = `${visibleLeft}px`;
                 wrapper.style.width = `${visibleWidth}px`;
                 wrapper.style.height = `${headerHeight}px`;
 
-                // scroller 需要容纳整个表格宽度
                 scroller.style.width = `${tableRect.width}px`;
-
-                // 通过 margin-left 模拟水平滚动偏移
-                // 偏移量 = 表格实际左边界 - 可见区域左边界
-                const offsetX = tableRect.left - visibleLeft;
-                scroller.style.marginLeft = `${offsetX}px`;
+                scroller.style.marginLeft = `${tableRect.left - visibleLeft}px`;
 
             } else {
                 wrapper.classList.remove('tsh-visible');
@@ -211,28 +228,57 @@ export default class TableStickyHeaderPlugin extends Plugin {
     }
 
     private syncColumnWidths(source: HTMLTableElement, target: HTMLTableElement) {
-        // 同步 thead 单元格宽度
-        const sourceTh = source.querySelectorAll('thead th, thead td');
-        const targetTh = target.querySelectorAll('thead th, thead td');
+        // The clone lives under document.body, so editor-scoped selectors no
+        // longer apply. Copy the computed visual styles instead of imposing a
+        // replacement theme on the sticky header.
+        const visualProperties = [
+            'text-align', 'vertical-align', 'font-family', 'font-size',
+            'font-weight', 'font-style', 'line-height', 'letter-spacing',
+            'text-transform', 'padding-top', 'padding-right', 'padding-bottom',
+            'padding-left', 'color', 'background-color', 'background-image',
+            'background-size', 'background-position', 'background-repeat',
+            'white-space', 'border-collapse', 'border-spacing', 'box-sizing',
+            'border-top-width', 'border-top-style', 'border-top-color',
+            'border-right-width', 'border-right-style', 'border-right-color',
+            'border-bottom-width', 'border-bottom-style', 'border-bottom-color',
+            'border-left-width', 'border-left-style', 'border-left-color'
+        ];
+        const copyStyles = (from: Element, to: HTMLElement) => {
+            const computed = window.getComputedStyle(from);
+            for (const property of visualProperties) {
+                to.style.setProperty(property, computed.getPropertyValue(property));
+            }
+        };
 
-        sourceTh.forEach((cell, i) => {
-            if (targetTh[i]) {
+        copyStyles(source, target);
+        const sourceHead = source.querySelector('thead');
+        const targetHead = target.querySelector('thead');
+        if (sourceHead && targetHead) {
+            copyStyles(sourceHead, targetHead as HTMLElement);
+        }
+
+        const sourceRows = source.querySelectorAll('thead tr');
+        const targetRows = target.querySelectorAll('thead tr');
+        sourceRows.forEach((row, i) => {
+            if (targetRows[i]) copyStyles(row, targetRows[i] as HTMLElement);
+        });
+
+        const sourceCells = source.querySelectorAll('thead th, thead td');
+        const targetCells = target.querySelectorAll('thead th, thead td');
+        sourceCells.forEach((cell, i) => {
+            if (targetCells[i]) {
                 const rect = (cell as HTMLElement).getBoundingClientRect();
-                const th = targetTh[i] as HTMLElement;
-                th.setCssStyles({
-                    width: `${rect.width}px`,
-                    minWidth: `${rect.width}px`,
-                    maxWidth: `${rect.width}px`,
-                    boxSizing: 'border-box',
-                });
+                const targetCell = targetCells[i] as HTMLElement;
+                copyStyles(cell, targetCell);
+                targetCell.style.setProperty('width', `${rect.width}px`);
+                targetCell.style.setProperty('min-width', `${rect.width}px`);
+                targetCell.style.setProperty('max-width', `${rect.width}px`);
+                targetCell.style.setProperty('box-sizing', 'border-box');
             }
         });
 
-        // 同步表格总宽度
         const sourceRect = source.getBoundingClientRect();
-        target.setCssStyles({
-            width: `${sourceRect.width}px`,
-            minWidth: `${sourceRect.width}px`,
-        });
+        target.style.setProperty('width', `${sourceRect.width}px`);
+        target.style.setProperty('min-width', `${sourceRect.width}px`);
     }
 }

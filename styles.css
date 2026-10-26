@@ -1,54 +1,43 @@
-/* Clone wrapper: pinned to the viewport, clips overflow */
+/* Clone wrapper: pinned to the visible table viewport */
 .tsh-clone-wrapper {
     position: fixed;
     z-index: 100;
     overflow: hidden;
     pointer-events: none;
     display: none;
+    box-sizing: border-box;
     background: var(--background-primary);
-    border: 1px solid var(--background-modifier-border);
-    border-top: none;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
 }
 
 .tsh-clone-wrapper.tsh-visible {
     display: block;
 }
 
-/* Inner scroller: syncs horizontal scrolling */
+/* The clone follows the source table's horizontal position. */
 .tsh-clone-scroller {
     overflow: hidden;
 }
 
-/* Cloned table: keep original styling, left aligned */
+/* Keep the source table's borders, spacing, and typography while ensuring
+   the floating header has an opaque surface. */
 .tsh-clone-wrapper table {
     margin: 0 !important;
-    table-layout: fixed !important;
-    border-collapse: collapse !important;
+    background-color: var(--background-primary) !important;
 }
 
-/* Header cells: background + border + padding */
-.tsh-clone-wrapper thead th,
-.tsh-clone-wrapper thead td {
-    background: var(--background-primary) !important;
-    border: 1px solid var(--background-modifier-border) !important;
-    padding-top: 0 !important;
-    padding-bottom: 0 !important;
-    padding-left: 10px !important;
-    padding-right: 10px !important;
+.tsh-clone-wrapper thead,
+.tsh-clone-wrapper tr,
+.tsh-clone-wrapper th,
+.tsh-clone-wrapper td {
+    background-color: var(--background-primary) !important;
+    background-image: none !important;
 }
 
-/* Only the header is shown */
-.tsh-clone-wrapper tbody {
-    visibility: hidden;
-    height: 0;
-    line-height: 0;
-    overflow: hidden;
-}
-
-.tsh-clone-wrapper tbody td {
-    padding: 0 !important;
-    border: none !important;
-    height: 0 !important;
-    line-height: 0 !important;
+/* Obsidian's live-preview table handles are cloned with the header but lose
+   their editor-scoped styling, showing up as stray dots. Hide them. */
+.tsh-clone-wrapper .table-col-drag-handle,
+.tsh-clone-wrapper .table-row-drag-handle,
+.tsh-clone-wrapper .table-col-btn,
+.tsh-clone-wrapper .table-row-btn {
+    display: none !important;
 }
